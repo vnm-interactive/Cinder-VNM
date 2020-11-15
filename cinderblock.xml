@@ -16,7 +16,7 @@
 	<includePath>../</includePath>
 </block>
 <template>templates/Melo Scene/template.xml</template>
-<template>templates/Minimalist VNM/template.xml</template>
+<template>templates/Minimalist3D/template.xml</template>
 <template>templates/DepthSensor VNM/template.xml</template>
-<template>templates/NonGame/template.xml</template>
+<template>templates/Minimalist2D/template.xml</template>
 </cinder>
