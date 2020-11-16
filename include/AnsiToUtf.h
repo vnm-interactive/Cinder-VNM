@@ -1,6 +1,7 @@
 #pragma once
 
 #if defined( CINDER_MSW )
+#define _HAS_STD_BYTE 0
 #include <string>
 #include <windows.h>
 
