@@ -423,15 +423,15 @@ namespace am
         return getAssetResource<vector<string>>(relativeFolderName, bind(loadPaths, placeholders::_1, placeholders::_2, false));
     }
 
-    audio::VoiceRef& voice(const string& relativeName)
+    audio::VoiceSamplePlayerNodeRef& voice(const string& relativeName)
     {
 #if defined(CINDER_MSW)
-        auto loader = [](const string & absoluteName, const string&) -> audio::VoiceRef
+        auto loader = [](const string & absoluteName, const string&) -> audio::VoiceSamplePlayerNodeRef
         {
             auto source = audio::load(DataSourcePath::create(absoluteName));
             return audio::Voice::create(source);
         };
-        return getAssetResource<audio::VoiceRef>(relativeName, loader);
+        return getAssetResource<audio::VoiceSamplePlayerNodeRef>(relativeName, loader);
 #else
         throw audio::AudioExc("ci::audio is unsupported");
 #endif
