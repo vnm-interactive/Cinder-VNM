@@ -140,7 +140,7 @@ namespace vnm
     void drawMinicofigImgui(bool createNewWindow = false)
     {
         if (createNewWindow)
-            ImGui::Begin(CONFIG_XML);
+            ImGui::Begin(CONFIG_XML, NULL, ImGuiWindowFlags_AlwaysAutoResize);
 
         if (ImGui::Button("Save"))
         {
