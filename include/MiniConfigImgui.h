@@ -142,15 +142,18 @@ namespace vnm
         if (createNewWindow)
             ImGui::Begin(CONFIG_XML);
 
-        if (ImGui::Button("Save Config"))
+        if (ImGui::Button("Save"))
         {
             writeConfig();
         }
 
-        if (ImGui::Button("Screen-shot"))
+        ImGui::SameLine();
+        if (ImGui::Button("Screenshot"))
         {
             takeScreenShot();
         }
+
+        ImGui::SameLine();
         if (ImGui::Button("Quit"))
         {
             App::get()->quit();
