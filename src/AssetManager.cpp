@@ -364,7 +364,12 @@ namespace am
                 }
 
                 if (isStockShader)
-                    return gl::getStockShader(def);
+                {
+                    auto glsl = gl::getStockShader(def);
+                    glsl->setLabel(label);
+
+                    return glsl;
+                }
             }
 
 #if defined( CINDER_GL_ES )
