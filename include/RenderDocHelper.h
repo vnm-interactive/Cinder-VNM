@@ -1,6 +1,7 @@
 #pragma once
 
 #include "renderdoc_app.h"
+#include <Windows.h>
 
 struct RenderDocHelper
 {
