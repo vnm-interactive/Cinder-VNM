@@ -159,6 +159,16 @@ namespace vnm
             App::get()->quit();
         }
         
+        auto profilerHtml = getAssetPath("webui_remotery/index.html");
+        if (fs::exists(profilerHtml))
+        {
+            ImGui::SameLine();
+            if (ImGui::Button("Profiler"))
+            {
+                launchWebBrowser(Url(profilerHtml.string(), true));
+            }
+        }
+
 #if !defined(NDEBUG) && !defined(IMGUI_DISABLE_DEMO_WINDOWS)
         static bool isDemoWindowOpened = false;
         if (ImGui::Button("ShowDemoWindow"))
