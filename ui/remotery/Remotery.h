@@ -127,6 +127,15 @@ documented just below this comment.
     #define RMT_PLATFORM_POSIX
 #endif
 
+// Architecture identification
+#ifdef RMT_PLATFORM_WINDOWS
+#ifdef _M_AMD64
+#define RMT_ARCH_64BIT
+#else
+#define RMT_ARCH_32BIT
+#endif
+#endif
+
 #ifdef RMT_DLL
     #if defined (RMT_PLATFORM_WINDOWS)
         #if defined (RMT_IMPL)
@@ -230,6 +239,7 @@ typedef enum rmtError
     RMT_ERROR_TLS_ALLOC_FAIL,                   // Attempt to allocate thread local storage failed
     RMT_ERROR_VIRTUAL_MEMORY_BUFFER_FAIL,       // Failed to create a virtual memory mirror buffer
     RMT_ERROR_CREATE_THREAD_FAIL,               // Failed to create a thread for the server
+    RMT_ERROR_OPEN_THREAD_HANDLE_FAIL,          // Failed to open a thread handle, given a thread id
 
     // Network TCP/IP socket errors
     RMT_ERROR_SOCKET_INIT_NETWORK_FAIL,         // Network initialisation failure (e.g. on Win32, WSAStartup fails)
@@ -282,8 +292,7 @@ typedef enum rmtError
 
     RMT_ERROR_CUDA_UNKNOWN,
 } rmtError;
-// clang-format off
-
+// clang-format on
 
 typedef enum rmtSampleFlags
 {
