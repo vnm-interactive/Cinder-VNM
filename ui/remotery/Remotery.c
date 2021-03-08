@@ -114,6 +114,7 @@ static rmtBool g_SettingsInitialized = RMT_FALSE;
         #undef max
         #include <tlhelp32.h>
         #include <winnt.h>
+        #include <processthreadsapi.h>
         #ifdef _XBOX_ONE
             #include "xmem.h"
         #endif
@@ -4317,9 +4318,6 @@ typedef struct Sample
 
     enum SampleType type;
 
-    // Used to anonymously copy sample data without knowning its type
-    rmtU32 size_bytes;
-
     // Hash generated from sample name
     rmtU32 name_hash;
 
@@ -4363,7 +4361,6 @@ static rmtError Sample_Constructor(Sample* sample)
     ObjectLink_Constructor((ObjectLink*)sample);
 
     sample->type = SampleType_CPU;
-    sample->size_bytes = sizeof(Sample);
     sample->name_hash = 0;
     sample->unique_id = 0;
     sample->unique_id_html_colour[0] = '#';
@@ -4406,6 +4403,51 @@ static void Sample_Prepare(Sample* sample, rmtU32 name_hash, Sample* parent)
     sample->call_count = 1;
     sample->recurse_depth = 0;
     sample->max_recurse_depth = 0;
+}
+
+static void Sample_Close(Sample* sample, rmtU64 us_end)
+{
+    // Aggregate samples use us_end to store start so that us_start is preserved
+    rmtU64 us_length = 0;
+    if (sample->call_count > 1 && sample->max_recurse_depth == 0)
+    {
+        us_length = (us_end - sample->us_end);
+    }
+    else
+    {
+        us_length = (us_end - sample->us_start);
+    }
+
+    sample->us_length += us_length;
+
+    // Sum length on the parent to track un-sampled time in the parent
+    if (sample->parent != NULL)
+    {
+        sample->parent->us_sampled_length += us_length;
+    }
+}
+
+static void Sample_CopyState(Sample* dst_sample, const Sample* src_sample)
+{
+    // Copy fields that don't override destination allocator links or transfer source sample tree positioning
+    // Also ignoring unique_id_html_colour as that's calculated in the Remotery thread
+    dst_sample->type = src_sample->type;
+    dst_sample->name_hash = src_sample->name_hash;
+    dst_sample->unique_id = src_sample->unique_id;
+    dst_sample->nb_children = src_sample->nb_children;
+    dst_sample->us_start = src_sample->us_start;
+    dst_sample->us_end = src_sample->us_end;
+    dst_sample->us_length = src_sample->us_length;
+    dst_sample->us_sampled_length = src_sample->us_sampled_length;
+    dst_sample->call_count = src_sample->call_count;
+    dst_sample->recurse_depth = src_sample->recurse_depth;
+    dst_sample->max_recurse_depth = src_sample->max_recurse_depth;
+
+    // Prepare empty tree links
+    dst_sample->parent = NULL;
+    dst_sample->first_child = NULL;
+    dst_sample->last_child = NULL;
+    dst_sample->next_sibling = NULL;
 }
 
 #define BIN_ERROR_CHECK(stmt)        \
@@ -4465,9 +4507,21 @@ typedef struct SampleTree
     Sample* root;
 
     // Most recently pushed sample
-    Sample* current_parent;
+    Sample* currentParent;
+
+    // Last time this sample tree was completed and sent to listeners, for stall detection
+    rmtU32 msLastTreeSendTime;
+
+    // Lightweight flag, changed with release/acquire semantics to inform the stall detector the state of the tree is unreliable
+    rmtU32 treeBeingModified;
 
 } SampleTree;
+
+// Notify tree watchers that its structure is in the process of being changed
+#define ModifySampleTree(tree, statements)      \
+    StoreRelease(&tree->treeBeingModified, 1);  \
+    statements;                                 \
+    StoreRelease(&tree->treeBeingModified, 0);
 
 static rmtError SampleTree_Constructor(SampleTree* tree, rmtU32 sample_size, ObjConstructor constructor,
                                        ObjDestructor destructor)
@@ -4478,19 +4532,25 @@ static rmtError SampleTree_Constructor(SampleTree* tree, rmtU32 sample_size, Obj
 
     tree->allocator = NULL;
     tree->root = NULL;
-    tree->current_parent = NULL;
+    tree->currentParent = NULL;
+    StoreRelease(&tree->msLastTreeSendTime, 0);
+    StoreRelease(&tree->treeBeingModified, 0);
 
     // Create the sample allocator
     New_3(ObjectAllocator, tree->allocator, sample_size, constructor, destructor);
     if (error != RMT_ERROR_NONE)
+    {
         return error;
+    }
 
     // Create a root sample that's around for the lifetime of the thread
     error = ObjectAllocator_Alloc(tree->allocator, (void**)&tree->root);
     if (error != RMT_ERROR_NONE)
+    {
         return error;
+    }
     Sample_Prepare(tree->root, 0, NULL);
-    tree->current_parent = tree->root;
+    tree->currentParent = tree->root;
 
     return RMT_ERROR_NONE;
 }
@@ -4527,8 +4587,8 @@ static rmtError SampleTree_Push(SampleTree* tree, rmtU32 name_hash, rmtU32 flags
 
     // As each tree has a root sample node allocated, a parent must always be present
     assert(tree != NULL);
-    assert(tree->current_parent != NULL);
-    parent = tree->current_parent;
+    assert(tree->currentParent != NULL);
+    parent = tree->currentParent;
 
     if ((flags & RMTSF_Aggregate) != 0)
     {
@@ -4538,7 +4598,7 @@ static rmtError SampleTree_Push(SampleTree* tree, rmtU32 name_hash, rmtU32 flags
         {
             if (sibling->name_hash == name_hash)
             {
-                tree->current_parent = sibling;
+                tree->currentParent = sibling;
                 sibling->call_count++;
                 *sample = sibling;
                 return RMT_ERROR_NONE;
@@ -4559,7 +4619,9 @@ static rmtError SampleTree_Push(SampleTree* tree, rmtU32 name_hash, rmtU32 flags
     // Allocate a new sample
     error = ObjectAllocator_Alloc(tree->allocator, (void**)sample);
     if (error != RMT_ERROR_NONE)
+    {
         return error;
+    }
     Sample_Prepare(*sample, name_hash, parent);
 
     // Generate a unique ID for this sample in the tree
@@ -4583,7 +4645,7 @@ static rmtError SampleTree_Push(SampleTree* tree, rmtU32 name_hash, rmtU32 flags
     }
 
     // Make this sample the new parent of any newly created samples
-    tree->current_parent = *sample;
+    tree->currentParent = *sample;
 
     return RMT_ERROR_NONE;
 }
@@ -4593,10 +4655,10 @@ static void SampleTree_Pop(SampleTree* tree, Sample* sample)
     assert(tree != NULL);
     assert(sample != NULL);
     assert(sample != tree->root);
-    tree->current_parent = sample->parent;
+    tree->currentParent = sample->parent;
 }
 
-static ObjectLink* FlattenSampleTree(Sample* sample, rmtU32* nb_samples)
+static ObjectLink* FlattenSamples(Sample* sample, rmtU32* nb_samples)
 {
     Sample* child;
     ObjectLink* cur_link = &sample->Link;
@@ -4610,7 +4672,7 @@ static ObjectLink* FlattenSampleTree(Sample* sample, rmtU32* nb_samples)
     // Link all children together
     for (child = sample->first_child; child != NULL; child = child->next_sibling)
     {
-        ObjectLink* last_link = FlattenSampleTree(child, nb_samples);
+        ObjectLink* last_link = FlattenSamples(child, nb_samples);
         last_link->next = (ObjectLink*)child->next_sibling;
         cur_link = last_link;
     }
@@ -4623,30 +4685,102 @@ static ObjectLink* FlattenSampleTree(Sample* sample, rmtU32* nb_samples)
     return cur_link;
 }
 
-static void FreeSampleTree(Sample* sample, ObjectAllocator* allocator)
+static void FreeSamples(Sample* sample, ObjectAllocator* allocator)
 {
     // Chain all samples together in a flat list
     rmtU32 nb_cleared_samples = 0;
-    ObjectLink* last_link = FlattenSampleTree(sample, &nb_cleared_samples);
+    ObjectLink* last_link = FlattenSamples(sample, &nb_cleared_samples);
 
     // Release the complete sample memory range
     if (sample->Link.next != NULL)
+    {
         ObjectAllocator_FreeRange(allocator, sample, last_link, nb_cleared_samples);
+    }
     else
+    {
         ObjectAllocator_Free(allocator, sample);
+}
+}
+
+static rmtError SampleTree_CopySample(Sample** out_dst_sample, Sample* dst_parent_sample, ObjectAllocator* allocator, const Sample* src_sample)
+{
+    Sample* src_child;
+
+    // Allocate a copy of the sample
+    Sample* dst_sample;
+    rmtError error = ObjectAllocator_Alloc(allocator, (void**)&dst_sample);
+    if (error != RMT_ERROR_NONE)
+    {
+        return error;
+    }
+    Sample_CopyState(dst_sample, src_sample);
+
+    // Link the newly created/copied sample to its parent
+    // Note that metrics including nb_children have already been copied by the Sample_CopyState call
+    if (dst_parent_sample != NULL)
+    {
+        if (dst_parent_sample->first_child == NULL)
+        {
+            dst_parent_sample->first_child = dst_sample;
+            dst_parent_sample->last_child = dst_sample;
+        }
+        else
+        {
+            assert(dst_parent_sample->last_child != NULL);
+            dst_parent_sample->last_child->next_sibling = dst_sample;
+            dst_parent_sample->last_child = dst_sample;
+        }
+    }
+
+    // Copy all children
+    for (src_child = src_sample->first_child; src_child != NULL; src_child = src_child->next_sibling)
+    {
+        Sample* dst_child;
+        error = SampleTree_CopySample(&dst_child, dst_sample, allocator, src_child);
+        if (error != RMT_ERROR_NONE)
+        {
+            return error;
+        }
+    }
+
+    *out_dst_sample = dst_sample;
+
+    return RMT_ERROR_NONE;
+}
+
+static rmtError SampleTree_Copy(SampleTree* dst_tree, const SampleTree* src_tree)
+{
+    rmtError error;
+
+    // Sample trees are allocated at startup and their allocators are persistent for the lifetime of the Remotery object.
+    // It's safe to reference the allocator and use it for sample lifetime.
+    ObjectAllocator* allocator = src_tree->allocator;
+    dst_tree->allocator = allocator;
+
+    // Copy from the root
+    error = SampleTree_CopySample(&dst_tree->root, NULL, allocator, src_tree->root);
+    if (error != RMT_ERROR_NONE)
+    {
+        return error;
+    }
+    dst_tree->currentParent = dst_tree->root;
+
+    return RMT_ERROR_NONE;
 }
 
 typedef struct Msg_SampleTree
 {
-    Sample* root_sample;
+    Sample* rootSample;
 
     ObjectAllocator* allocator;
 
-    rmtPStr thread_name;
+    rmtPStr threadName;
+
+    rmtBool partialTree;
 } Msg_SampleTree;
 
 static void QueueSampleTree(rmtMessageQueue* queue, Sample* sample, ObjectAllocator* allocator, rmtPStr thread_name,
-                            struct ThreadProfiler* thread_profiler)
+                            struct ThreadProfiler* thread_profiler, rmtBool partial_tree)
 {
     Msg_SampleTree* payload;
 
@@ -4654,16 +4788,17 @@ static void QueueSampleTree(rmtMessageQueue* queue, Sample* sample, ObjectAlloca
     Message* message = rmtMessageQueue_AllocMessage(queue, sizeof(Msg_SampleTree), thread_profiler);
     if (message == NULL)
     {
-        // Discard the tree on failure
-        FreeSampleTree(sample, allocator);
+        // Discard tree samples on failure
+        FreeSamples(sample, allocator);
         return;
     }
 
     // Populate and commit
     payload = (Msg_SampleTree*)message->payload;
-    payload->root_sample = sample;
+    payload->rootSample = sample;
     payload->allocator = allocator;
-    payload->thread_name = thread_name;
+    payload->threadName = thread_name;
+    payload->partialTree = partial_tree;
     rmtMessageQueue_CommitMessage(message, MsgID_SampleTree);
 }
 
@@ -4714,12 +4849,13 @@ typedef struct ThreadProfiler
     // Storage for backing up initial register values when modifying a thread's context
     rmtU64 registerBackup0;                                                                         // 0
     rmtU64 registerBackup1;                                                                         // 8
+    rmtU64 registerBackup2;                                                                         // 16
     
     // Used to schedule callbacks taking into account some threads may be sleeping
-    rmtS32 nbSamplesWithoutCallback;                                                                // 12
+    rmtS32 nbSamplesWithoutCallback;                                                                // 24
 
     // Index of the processor the thread was last seen running on
-    rmtU32 processorIndex;                                                                          // 16
+    rmtU32 processorIndex;                                                                          // 28
     rmtU32 lastProcessorIndex;
 
     // OS thread ID/handle
@@ -4829,7 +4965,11 @@ static void ThreadProfiler_Destructor(ThreadProfiler* thread_profiler)
 
 static rmtError ThreadProfiler_Push(SampleTree* tree, rmtU32 name_hash, rmtU32 flags, Sample** sample)
 {
-    return SampleTree_Push(tree, name_hash, flags, sample);
+    rmtError error;
+    ModifySampleTree(tree, 
+        error = SampleTree_Push(tree, name_hash, flags, sample);
+    );
+    return error;
 }
 
 static rmtBool ThreadProfiler_Pop(ThreadProfiler* thread_profiler, rmtMessageQueue* queue, Sample* sample)
@@ -4838,14 +4978,21 @@ static rmtBool ThreadProfiler_Pop(ThreadProfiler* thread_profiler, rmtMessageQue
     SampleTree_Pop(tree, sample);
 
     // Are we back at the root?
-    if (tree->current_parent == tree->root)
+    if (tree->currentParent == tree->root)
     {
+        Sample* root;
+
         // Disconnect all samples from the root and pack in the chosen message queue
-        Sample* root = tree->root;
+        ModifySampleTree(tree, 
+        root = tree->root;
         root->first_child = NULL;
         root->last_child = NULL;
         root->nb_children = 0;
-        QueueSampleTree(queue, sample, tree->allocator, thread_profiler->threadName, thread_profiler);
+        );
+        QueueSampleTree(queue, sample, tree->allocator, thread_profiler->threadName, thread_profiler, RMT_FALSE);
+
+        // Update the last send time for this tree, for stall detection
+        StoreRelease(&tree->msLastTreeSendTime, (rmtU32)(sample->us_end / 1000));
 
         return RMT_TRUE;
     }
@@ -4896,6 +5043,7 @@ typedef struct ThreadProfilers
     
     // On x64 machines this points to the sample function
     void* compiledSampleFn;
+    rmtU32 compiledSampleFnSize;
     
     // Used to store thread profilers bound to an OS thread
     rmtTLS threadProfilerTlsHandle;
@@ -4922,7 +5070,7 @@ static rmtError SampleThreadsLoop(rmtThread* rmt_thread);
 
 #ifdef RMT_PLATFORM_WINDOWS
 #ifdef RMT_ARCH_64BIT
-static void* CreateSampleCallback();
+static void* CreateSampleCallback(rmtU32* out_size);
 #endif
 #endif
 
@@ -4934,6 +5082,7 @@ static rmtError ThreadProfilers_Constructor(ThreadProfilers* thread_profilers, u
     thread_profilers->timer = timer;
     thread_profilers->mqToRmtThread = mq_to_rmt_thread;
     thread_profilers->compiledSampleFn = NULL;
+    thread_profilers->compiledSampleFnSize = 0;
     thread_profilers->threadProfilerTlsHandle = TLS_INVALID_HANDLE;
     thread_profilers->nbThreadProfilers = 0;
     thread_profilers->maxNbThreadProfilers = sizeof(thread_profilers->threadProfilers) / sizeof(thread_profilers->threadProfilers[0]);
@@ -4943,7 +5092,7 @@ static rmtError ThreadProfilers_Constructor(ThreadProfilers* thread_profilers, u
 
 #ifdef RMT_PLATFORM_WINDOWS
 #ifdef RMT_ARCH_64BIT
-    thread_profilers->compiledSampleFn = CreateSampleCallback();
+    thread_profilers->compiledSampleFn = CreateSampleCallback(&thread_profilers->compiledSampleFnSize);
     if (thread_profilers->compiledSampleFn == NULL)
     {
         return RMT_ERROR_MALLOC_FAIL;
@@ -5060,6 +5209,26 @@ static rmtError ThreadProfilers_GetCurrentThreadProfiler(ThreadProfilers* thread
     return RMT_ERROR_NONE;
 }
 
+static rmtBool ThreadProfilers_ThreadInCallback(ThreadProfilers* thread_profilers, CONTEXT* context)
+{
+#ifdef RMT_PLATFORM_WINDOWS
+#ifdef RMT_ARCH_32BIT
+    if (context->Eip >= (DWORD)thread_profilers->compiledSampleFn &&
+        context->Eip < (DWORD)((char*)thread_profilers->compiledSampleFn + thread_profilers->compiledSampleFnSize))
+    {
+        return RMT_TRUE;
+    }
+#else
+    if (context->Rip >= (DWORD64)thread_profilers->compiledSampleFn &&
+        context->Rip < (DWORD64)((char*)thread_profilers->compiledSampleFn + thread_profilers->compiledSampleFnSize))
+    {
+        return RMT_TRUE;
+    }
+#endif
+#endif
+    return RMT_FALSE;
+}
+
 /*
 ------------------------------------------------------------------------------------------------------------------------
 ------------------------------------------------------------------------------------------------------------------------
@@ -5103,6 +5272,8 @@ static void GatherThreads(ThreadProfilers* thread_profilers)
 
             success = Thread32Next(handle, &thread_entry);
         }
+
+        CloseHandle(handle);
     }
 
 #endif
@@ -5201,24 +5372,20 @@ __declspec(naked) static void SampleCallback()
     __asm
     {
         // Push the EIP return address used by the final ret instruction
-        push eax
+        push ebx
 
         // We might be in the middle of something like a cmp/jmp instruction pair so preserve EFLAGS
         // (Classic example which seems to pop up regularly is _RTC_CheckESP, with cmp/call/jne)
         pushfd
 
-        // Save registers used by cpuid (eax and edi are restored via thread pointer)
-        push ebx
+        // Push all volatile registers as we don't know what the function calls below will destroy
+        push eax
         push ecx
         push edx
 
-        // Get the current processor index.
-        // Function 1 to return APIC-ID: https://c9x.me/x86/html/file_module_x86_id_45.html
-        // TODO(don): Needs further refinement, see https://wiki.osdev.org/Detecting_CPU_Topology_(80x86)
-        mov eax, 1
-        cpuid
-        shr ebx, 24
-        mov [edi].processorIndex, ebx
+        // Retrieve and store the current processor index
+        call esi
+        mov [edi].processorIndex, eax
 
         // Mark as ready for scheduling another callback
         // Intel x86 store release
@@ -5227,16 +5394,17 @@ __declspec(naked) static void SampleCallback()
         // Restore preserved register state
         pop edx
         pop ecx
-        pop ebx
+        pop eax
 
         // Restore registers used to provide parameters to the callback
-        mov eax, dword ptr [edi].registerBackup0
-        mov edi, dword ptr [edi].registerBackup1
+        mov ebx, dword ptr [edi].registerBackup0
+        mov esi, dword ptr [edi].registerBackup1
+        mov edi, dword ptr [edi].registerBackup2
 
         // Restore EFLAGS
         popfd
 
-        // Pops the original EIP of the stack and jmps to origin suspend point in the thread
+        // Pops the original EIP off the stack and jmps to origin suspend point in the thread
         ret
     }
 }
@@ -5244,40 +5412,145 @@ __declspec(naked) static void SampleCallback()
 // Generated with https://defuse.ca/online-x86-assembler.htm
 static rmtU8 SampleCallbackBytes[] =
 {
-    0x50,                                           // push rax
-    0x9C,                                           // pushfq
+    // Push the RIP return address used by the final ret instruction
     0x53,                                           // push rbx
+
+    // We might be in the middle of something like a cmp/jmp instruction pair so preserve RFLAGS
+    // (Classic example which seems to pop up regularly is _RTC_CheckESP, with cmp/call/jne)
+    0x9C,                                           // pushfq
+
+    // Push all volatile registers as we don't know what the function calls below will destroy
+    0x50,                                           // push rax
     0x51,                                           // push rcx
     0x52,                                           // push rdx
-    0xB8, 0x01, 0x00, 0x00, 0x00,                   // mov eax, 1
-    0x0F, 0xA2,                                     // cpuid
-    0xC1, 0xEB, 0x18,                               // shr ebx, 24
-    0x89, 0x5F, 0x10,                               // mov dword ptr [rdi + 16], ebx
-    0xC7, 0x47, 0x0C, 0x00, 0x00, 0x00, 0x00,       // mov dword ptr [rdi + 12], 0
+    0x41, 0x50,                                     // push r8
+    0x41, 0x51,                                     // push r9
+    0x41, 0x52,                                     // push r10
+    0x41, 0x53,                                     // push r11
+
+    // Retrieve and store the current processor index
+    0xFF, 0xD6,                                     // call rsi
+    0x89, 0x47, 0x1C,                               // mov dword ptr [rdi + 28], eax
+
+    // Mark as ready for scheduling another callback
+    // Intel x64 store release
+    0xC7, 0x47, 0x18, 0x00, 0x00, 0x00, 0x00,       // mov dword ptr [rdi + 24], 0
+
+    // Restore preserved register state
+    0x41, 0x5B,                                     // pop r11
+    0x41, 0x5A,                                     // pop r10
+    0x41, 0x59,                                     // pop r9
+    0x41, 0x58,                                     // pop r8
     0x5A,                                           // pop rdx
     0x59,                                           // pop rcx
-    0x5B,                                           // pop rbx
-    0x48, 0x8B, 0x07,                               // mov rax, qword ptr [rdi + 0]
-    0x48, 0x8B, 0x7F, 0x08,                         // mov rdi, qword ptr [rdi + 8]
+    0x58,                                           // pop rax
+
+    // Restore registers used to provide parameters to the callback
+    0x48, 0x8B, 0x1F,                               // mov rbx, qword ptr [rdi + 0]
+    0x48, 0x8B, 0x77, 0x08,                         // mov rsi, qword ptr [rdi + 8]
+    0x48, 0x8B, 0x7F, 0x10,                         // mov rdi, qword ptr [rdi + 16]
+
+    // Restore RFLAGS
     0x9D,                                           // popfq
+
+    // Pops the original EIP off the stack and jmps to origin suspend point in the thread
     0xC3                                            // ret
 };
 #ifdef RMT_PLATFORM_WINDOWS
-static void* CreateSampleCallback()
+static void* CreateSampleCallback(rmtU32* out_size)
 {
-    // Allocate and copy to executable space for the 64-bit compiled sample function
+    // Allocate page for the generated code
+    DWORD size = 4096;
     DWORD old_protect;
-    void* function = VirtualAlloc(NULL, 4096, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+    void* function = VirtualAlloc(NULL, size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
     if (function == NULL)
     {
         return NULL;
     }
+
+    // Clear whole allocation to int 3h
+    memset(function, 0xCC, size);
+
+    // Copy over the generated code
     memcpy(function, SampleCallbackBytes, sizeof(SampleCallbackBytes));
-    VirtualProtect(function, 4096, PAGE_EXECUTE_READ, &old_protect);
+    *out_size = sizeof(SampleCallbackBytes);
+
+    // Enable execution
+    VirtualProtect(function, size, PAGE_EXECUTE_READ, &old_protect);
     return function;
 }
 #endif
 #endif
+
+#ifdef __cplusplus
+static_assert(offsetof(ThreadProfiler, nbSamplesWithoutCallback) == 24, "");
+static_assert(offsetof(ThreadProfiler, processorIndex) == 28, "");
+#endif
+
+static void CloseOpenSamples(Sample* sample, rmtU64 sample_time_us, rmtU32 parents_are_last)
+{
+    Sample* child_sample;
+
+    // Depth-first search into children as we want to close child samples before their parents
+    for (child_sample = sample->first_child; child_sample != NULL; child_sample = child_sample->next_sibling)
+    {
+        rmtU32 is_last = parents_are_last & (child_sample == sample->last_child ? 1 : 0);
+        CloseOpenSamples(child_sample, sample_time_us, is_last);
+    }
+
+    // A chain of open samples will be linked from the root to the deepest, currently open sample
+    if (parents_are_last > 0)
+    {
+        Sample_Close(sample, sample_time_us);
+    }
+}
+
+static rmtError CheckForStallingSamples(SampleTree* stalling_sample_tree, ThreadProfiler* thread_profiler, rmtU64 sample_time_us)
+{
+    SampleTree* sample_tree;
+    rmtU32 sample_time_s = (rmtU32)(sample_time_us / 1000);
+
+    // Initialise to empty
+    stalling_sample_tree->root = NULL;
+    stalling_sample_tree->allocator = NULL;
+
+    // Skip the stall check if the tree is being modified
+    sample_tree = thread_profiler->sampleTrees[SampleType_CPU];
+    if (LoadAcquire(&sample_tree->treeBeingModified) != 0)
+    {
+        return RMT_ERROR_NONE;
+    }
+
+    if (sample_tree != NULL)
+    {
+        // The root is a dummy root inserted on tree creation so check that for children
+        rmtBool send = RMT_FALSE;
+        Sample* root_sample = sample_tree->root;
+        if (root_sample != NULL && root_sample->nb_children > 0)
+        {
+            if (sample_time_s - LoadAcquire(&sample_tree->msLastTreeSendTime) > 1000)
+            {
+                send = RMT_TRUE;
+                StoreRelease(&sample_tree->msLastTreeSendTime, sample_time_s);
+            }
+        }
+
+        if (send == RMT_TRUE)
+        {
+            // Make a local copy of the tree as we want to keep the current tree for active profiling
+            rmtError error = SampleTree_Copy(stalling_sample_tree, sample_tree);
+            if (error != RMT_ERROR_NONE)
+            {
+                return error;
+            }
+            
+            // Close all samples from the deepest open sample, right back to the root
+            CloseOpenSamples(stalling_sample_tree->root, sample_time_us, 1);
+        }
+    }
+
+    return RMT_ERROR_NONE;
+}
 
 static rmtError InitThreadSampling(ThreadProfilers* thread_profilers)
 {
@@ -5376,7 +5649,9 @@ static rmtError SampleThreadsLoop(rmtThread* rmt_thread)
             rmtU32 thread_id;
             ThreadProfiler* thread_profiler;
             rmtThreadHandle thread_handle;
+            rmtU64 sample_time_us;
             rmtU32 sample_count;
+            SampleTree stalling_sample_tree;
 
             lfsr_value = GaloisLFSRNext(lfsr_value, xor_mask);
 
@@ -5402,6 +5677,10 @@ static rmtError SampleThreadsLoop(rmtThread* rmt_thread)
                 continue;
             }
 
+            // While the thread is suspended take the chance to check for samples tress that may never complete
+            sample_time_us = usTimer_Get(thread_profilers->timer);
+            CheckForStallingSamples(&stalling_sample_tree, thread_profiler, sample_time_us);
+
             // Mark the processor this thread was last recorded as running on.
             // Note that a thread might be pre-empted multiple times in-between sampling. Given a sampling rate equal to the
             // scheduling quantum, this doesn't happen too often. However in such cases, whoever marks the processor last is
@@ -5410,28 +5689,36 @@ static rmtError SampleThreadsLoop(rmtThread* rmt_thread)
             processor_index = thread_profiler->processorIndex;
             if (processor_index != -1)
             {
+                assert(processor_index < nb_processors);
                 processors[processor_index].threadProfiler = thread_profiler;
                 processors[processor_index].sampleCount = sample_count;
-                processors[processor_index].sampleTime = usTimer_Get(thread_profilers->timer);
+                processors[processor_index].sampleTime = sample_time_us;
             }
 
             // Swap in a new context with our callback if one is not already scheduled on this thread
             if (sample_count == 0)
             {
-                if (rmtGetUserModeThreadContext(thread_handle, &context) == RMT_TRUE)
+                if (rmtGetUserModeThreadContext(thread_handle, &context) == RMT_TRUE &&
+                    // There is a slight window of opportunity, after which the callback sets nbSamplesWithoutCallback=0,
+                    // for this loop to suspend a thread while it's executing the last instructions of the callback.
+                    ThreadProfilers_ThreadInCallback(thread_profilers, &context) == RMT_FALSE)
                 {
                 #ifdef RMT_PLATFORM_WINDOWS
                 #ifdef RMT_ARCH_64BIT
-                    thread_profiler->registerBackup0 = context.Rax;
-                    thread_profiler->registerBackup1 = context.Rdi;
-                    context.Rax = context.Rip;
+                    thread_profiler->registerBackup0 = context.Rbx;
+                    thread_profiler->registerBackup1 = context.Rsi;
+                    thread_profiler->registerBackup2 = context.Rdi;
+                    context.Rbx = context.Rip;
+                    context.Rsi = (rmtU64)GetCurrentProcessorNumber;
                     context.Rdi = (rmtU64)thread_profiler;
                     context.Rip = (DWORD64)thread_profilers->compiledSampleFn;
                 #endif
                  #ifdef RMT_ARCH_32BIT
-                    thread_profiler->registerBackup0 = context.Eax;
-                    thread_profiler->registerBackup1 = context.Edi;
-                    context.Eax = context.Eip;
+                    thread_profiler->registerBackup0 = context.Ebx;
+                    thread_profiler->registerBackup1 = context.Esi;
+                    thread_profiler->registerBackup2 = context.Edi;
+                    context.Ebx = context.Eip;
+                    context.Esi = (rmtU32)GetCurrentProcessorNumber;
                     context.Edi = (rmtU32)thread_profiler;
                     context.Eip = (DWORD)&SampleCallback;
                 #endif
@@ -5446,6 +5733,16 @@ static rmtError SampleThreadsLoop(rmtThread* rmt_thread)
             }
 
             rmtResumeThread(thread_handle);
+
+            if (stalling_sample_tree.root != NULL)
+            {
+                // If there is stalling sample tree on this thread then send it to listeners.
+                // Do the send *outside* of all Suspend/Resume calls as we have no way of knowing who is reading/writing the queue
+                // Mark this as partial so that the listeners know it will be overwritten.
+                Sample* sample = stalling_sample_tree.root->first_child;
+                QueueSampleTree(thread_profilers->mqToRmtThread, sample, stalling_sample_tree.allocator, thread_profiler->threadName, thread_profiler, RMT_TRUE);
+            }
+
 
         } while (lfsr_value != lfsr_seed);
 
@@ -5462,6 +5759,7 @@ static rmtError SampleThreadsLoop(rmtThread* rmt_thread)
                 rmtU32 last_processor_index = thread_profiler->lastProcessorIndex;
                 if (last_processor_index != -1 && last_processor_index != processor_index)
                 {
+                    assert(last_processor_index < nb_processors);
                     if (processors[last_processor_index].threadProfiler == thread_profiler)
                     {
                         processors[last_processor_index].threadProfiler = NULL;
@@ -5671,27 +5969,36 @@ static rmtError bin_SampleTree(Buffer* buffer, Msg_SampleTree* msg)
 {
     Sample* root_sample;
     char thread_name[256];
-    rmtU32 digest_hash = 0, nb_samples = 0;
+    rmtU32 digest_hash = 0;
+    rmtU32 nb_samples = 0;
     rmtError error;
 
     assert(buffer != NULL);
     assert(msg != NULL);
 
     // Get the message root sample
-    root_sample = msg->root_sample;
+    root_sample = msg->rootSample;
     assert(root_sample != NULL);
 
     // Add any sample types as a thread name post-fix to ensure they get their own viewer
     thread_name[0] = 0;
-    strncat_s(thread_name, sizeof(thread_name), msg->thread_name, strnlen_s(msg->thread_name, 255));
+    strncat_s(thread_name, sizeof(thread_name), msg->threadName, strnlen_s(msg->threadName, 255));
     if (root_sample->type == SampleType_CUDA)
+    {
         strncat_s(thread_name, sizeof(thread_name), " (CUDA)", 7);
+    }
     if (root_sample->type == SampleType_D3D11)
+    {
         strncat_s(thread_name, sizeof(thread_name), " (D3D11)", 8);
+    }
     if (root_sample->type == SampleType_OpenGL)
+    {
         strncat_s(thread_name, sizeof(thread_name), " (OpenGL)", 9);
+    }
     if (root_sample->type == SampleType_Metal)
+    {
         strncat_s(thread_name, sizeof(thread_name), " (Metal)", 8);
+    }
 
     // Get digest hash of samples so that viewer can efficiently rebuild its tables
     GetSampleDigest(root_sample, &digest_hash, &nb_samples);
@@ -5703,6 +6010,7 @@ static rmtError bin_SampleTree(Buffer* buffer, Msg_SampleTree* msg)
     BIN_ERROR_CHECK(Buffer_WriteStringWithLength(buffer, thread_name));
     BIN_ERROR_CHECK(Buffer_WriteU32(buffer, nb_samples));
     BIN_ERROR_CHECK(Buffer_WriteU32(buffer, digest_hash));
+    BIN_ERROR_CHECK(Buffer_WriteU32(buffer, msg->partialTree ? 1 : 0));
 
     // Write entire sample tree
     BIN_ERROR_CHECK(bin_Sample(buffer, root_sample));
@@ -5731,7 +6039,7 @@ static rmtError Remotery_SendSampleTreeMessage(Remotery* rmt, Message* message)
 
     // Get the message root sample
     sample_tree = (Msg_SampleTree*)message->payload;
-    sample = sample_tree->root_sample;
+    sample = sample_tree->rootSample;
     assert(sample != NULL);
 
 #if RMT_USE_CUDA
@@ -5744,8 +6052,8 @@ static rmtError Remotery_SendSampleTreeMessage(Remotery* rmt, Message* message)
         rmt_EndCPUSample();
         if (!are_samples_ready)
         {
-            QueueSampleTree(rmt->mq_to_rmt_thread, sample, sample_tree->allocator, sample_tree->thread_name,
-                                message->threadProfiler);
+            QueueSampleTree(rmt->mq_to_rmt_thread, sample, sample_tree->allocator, sample_tree->threadName,
+                                message->threadProfiler, RMT_FALSE);
             return RMT_ERROR_NONE;
         }
 
@@ -5765,8 +6073,8 @@ static rmtError Remotery_SendSampleTreeMessage(Remotery* rmt, Message* message)
     error = bin_SampleTree(bin_buf, sample_tree);
     rmt_EndCPUSample();
 
-    // Release the sample tree back to its allocator
-    FreeSampleTree(sample, sample_tree->allocator);
+    // Release sample tree samples back to their allocator
+    FreeSamples(sample, sample_tree->allocator);
 
     if (error != RMT_ERROR_NONE)
     {
@@ -5951,7 +6259,7 @@ static void Remotery_FlushMessageQueue(Remotery* rmt)
             // Release all samples back to their allocators
             case MsgID_SampleTree: {
                 Msg_SampleTree* sample_tree = (Msg_SampleTree*)message->payload;
-                FreeSampleTree(sample_tree->root_sample, sample_tree->allocator);
+                FreeSamples(sample_tree->rootSample, sample_tree->allocator);
                 break;
             }
 
@@ -6582,7 +6890,7 @@ RMT_API void _rmt_EndCPUSample(void)
 
     if (ThreadProfilers_GetCurrentThreadProfiler(g_Remotery->threadProfilers, &thread_profiler) == RMT_ERROR_NONE)
     {
-        Sample* sample = thread_profiler->sampleTrees[SampleType_CPU]->current_parent;
+        Sample* sample = thread_profiler->sampleTrees[SampleType_CPU]->currentParent;
 
         if (sample->recurse_depth > 0)
         {
@@ -6591,20 +6899,7 @@ RMT_API void _rmt_EndCPUSample(void)
         else
         {
             rmtU64 us_end = usTimer_Get(&g_Remotery->timer);
-
-            // Aggregate samples use us_end to store start so that us_start is preserved
-            rmtU64 us_length = 0;
-            if (sample->call_count > 1 && sample->max_recurse_depth == 0)
-                us_length = (us_end - sample->us_end);
-            else
-                us_length = (us_end - sample->us_start);
-
-            sample->us_length += us_length;
-
-            // Sum length on the parent to track un-sampled time in the parent
-            if (sample->parent != NULL)
-                sample->parent->us_sampled_length += us_length;
-
+            Sample_Close(sample, us_end);
             ThreadProfiler_Pop(thread_profiler, g_Remotery->mq_to_rmt_thread, sample);
         }
     }
@@ -6662,7 +6957,7 @@ static void GatherQueuedSamples(Remotery* rmt, Message* message)
     if (message->id == MsgID_SampleTree)
     {
         Msg_SampleTree* sample_tree = (Msg_SampleTree*)message->payload;
-        Sample* sample = sample_tree->root_sample;
+        Sample* sample = sample_tree->rootSample;
         if (sample->type == gather_data->sample_type)
         {
             // Make a copy of the entire sample tree as the remotery thread may overwrite it while
@@ -6695,7 +6990,7 @@ static void FreePendingSampleTrees(Remotery* rmt, SampleType sample_type, Buffer
         Message* message = (Message*)data;
         rmtU32 message_size = rmtMessageQueue_SizeForPayload(message->payload_size);
         Msg_SampleTree* sample_tree = (Msg_SampleTree*)message->payload;
-        FreeSampleTree(sample_tree->root_sample, sample_tree->allocator);
+        FreeSamples(sample_tree->rootSample, sample_tree->allocator);
         data += message_size;
     }
 }
@@ -6825,7 +7120,6 @@ static rmtError CUDASample_Constructor(CUDASample* sample)
     // Chain to sample constructor
     Sample_Constructor((Sample*)sample);
     sample->base.type = SampleType_CUDA;
-    sample->base.size_bytes = sizeof(CUDASample);
     sample->event_start = NULL;
     sample->event_end = NULL;
 
@@ -6967,7 +7261,7 @@ RMT_API void _rmt_EndCUDASample(void* stream)
 
     if (ThreadProfilers_GetCurrentThreadProfiler(g_Remotery->threadProfilers, &thread_profiler) == RMT_ERROR_NONE)
     {
-        CUDASample* sample = (CUDASample*)thread_profiler->sampleTrees[SampleType_CUDA]->current_parent;
+        CUDASample* sample = (CUDASample*)thread_profiler->sampleTrees[SampleType_CUDA]->currentParent;
         if (sample->base.recurse_depth > 0)
         {
             sample->base.recurse_depth--;
@@ -7377,7 +7671,6 @@ static rmtError D3D11Sample_Constructor(D3D11Sample* sample)
     // Chain to sample constructor
     Sample_Constructor((Sample*)sample);
     sample->base.type = SampleType_D3D11;
-    sample->base.size_bytes = sizeof(D3D11Sample);
     New_0(D3D11Timestamp, sample->timestamp);
 
     return RMT_ERROR_NONE;
@@ -7566,7 +7859,7 @@ static void UpdateD3D11Frame(ThreadProfiler* thread_profiler)
         // There's only one valid message type in this queue
         assert(message->id == MsgID_SampleTree);
         sample_tree = (Msg_SampleTree*)message->payload;
-        sample = sample_tree->root_sample;
+        sample = sample_tree->rootSample;
         assert(sample->type == SampleType_D3D11);
 
         // Retrieve timing of all D3D11 samples
@@ -7575,8 +7868,8 @@ static void UpdateD3D11Frame(ThreadProfiler* thread_profiler)
             break;
 
         // Pass samples onto the remotery thread for sending to the viewer
-        QueueSampleTree(g_Remotery->mq_to_rmt_thread, sample, sample_tree->allocator, sample_tree->thread_name,
-                             message->threadProfiler);
+        QueueSampleTree(g_Remotery->mq_to_rmt_thread, sample, sample_tree->allocator, sample_tree->threadName,
+                             message->threadProfiler, RMT_FALSE);
         rmtMessageQueue_ConsumeNextMessage(d3d11->mq_to_d3d11_main, message);
     }
 
@@ -7602,7 +7895,7 @@ RMT_API void _rmt_EndD3D11Sample(void)
             return;
 
         // Close the timestamp
-        d3d_sample = (D3D11Sample*)thread_profiler->sampleTrees[SampleType_D3D11]->current_parent;
+        d3d_sample = (D3D11Sample*)thread_profiler->sampleTrees[SampleType_D3D11]->currentParent;
         if (d3d_sample->base.recurse_depth > 0)
         {
             d3d_sample->base.recurse_depth--;
@@ -7980,7 +8273,6 @@ static rmtError OpenGLSample_Constructor(OpenGLSample* sample)
     // Chain to sample constructor
     Sample_Constructor((Sample*)sample);
     sample->base.type = SampleType_OpenGL;
-    sample->base.size_bytes = sizeof(OpenGLSample);
     New_0(OpenGLTimestamp, sample->timestamp);
 
     return RMT_ERROR_NONE;
@@ -8148,7 +8440,7 @@ static void UpdateOpenGLFrame(void)
         // There's only one valid message type in this queue
         assert(message->id == MsgID_SampleTree);
         sample_tree = (Msg_SampleTree*)message->payload;
-        sample = sample_tree->root_sample;
+        sample = sample_tree->rootSample;
         assert(sample->type == SampleType_OpenGL);
 
         // Retrieve timing of all OpenGL samples
@@ -8157,8 +8449,8 @@ static void UpdateOpenGLFrame(void)
             break;
 
         // Pass samples onto the remotery thread for sending to the viewer
-        QueueSampleTree(g_Remotery->mq_to_rmt_thread, sample, sample_tree->allocator, sample_tree->thread_name,
-                             message->threadProfiler);
+        QueueSampleTree(g_Remotery->mq_to_rmt_thread, sample, sample_tree->allocator, sample_tree->threadName,
+                             message->threadProfiler, RMT_FALSE);
         rmtMessageQueue_ConsumeNextMessage(opengl->mq_to_opengl_main, message);
     }
 
@@ -8175,7 +8467,7 @@ RMT_API void _rmt_EndOpenGLSample(void)
     if (ThreadProfilers_GetCurrentThreadProfiler(g_Remotery->threadProfilers, &thread_profiler) == RMT_ERROR_NONE)
     {
         // Close the timestamp
-        OpenGLSample* ogl_sample = (OpenGLSample*)thread_profiler->sampleTrees[SampleType_OpenGL]->current_parent;
+        OpenGLSample* ogl_sample = (OpenGLSample*)thread_profiler->sampleTrees[SampleType_OpenGL]->currentParent;
         if (ogl_sample->base.recurse_depth > 0)
         {
             ogl_sample->base.recurse_depth--;
@@ -8325,7 +8617,6 @@ static rmtError MetalSample_Constructor(MetalSample* sample)
     // Chain to sample constructor
     Sample_Constructor((Sample*)sample);
     sample->base.type = SampleType_Metal;
-    sample->base.size_bytes = sizeof(MetalSample);
     New_0(MetalTimestamp, sample->timestamp);
 
     return RMT_ERROR_NONE;
@@ -8439,7 +8730,7 @@ static void UpdateMetalFrame(void)
         // There's only one valid message type in this queue
         assert(message->id == MsgID_SampleTree);
         sample_tree = (Msg_SampleTree*)message->payload;
-        sample = sample_tree->root_sample;
+        sample = sample_tree->rootSample;
         assert(sample->type == SampleType_Metal);
 
         // Retrieve timing of all Metal samples
@@ -8448,8 +8739,8 @@ static void UpdateMetalFrame(void)
             break;
 
         // Pass samples onto the remotery thread for sending to the viewer
-        QueueSampleTree(g_Remotery->mq_to_rmt_thread, sample, sample_tree->allocator, sample_tree->thread_name,
-                             message->threadProfiler);
+        QueueSampleTree(g_Remotery->mq_to_rmt_thread, sample, sample_tree->allocator, sample_tree->threadName,
+                             message->threadProfiler, RMT_FALSE);
         rmtMessageQueue_ConsumeNextMessage(metal->mq_to_metal_main, message);
     }
 
@@ -8466,7 +8757,7 @@ RMT_API void _rmt_EndMetalSample(void)
     if (ThreadProfilers_GetCurrentThreadProfiler(g_Remotery->threadProfilers, &thread_profiler) == RMT_ERROR_NONE)
     {
         // Close the timestamp
-        MetalSample* metal_sample = (MetalSample*)thread_profiler->sampleTrees[SampleType_Metal]->current_parent;
+        MetalSample* metal_sample = (MetalSample*)thread_profiler->sampleTrees[SampleType_Metal]->currentParent;
         if (metal_sample->base.recurse_depth > 0)
         {
             metal_sample->base.recurse_depth--;
